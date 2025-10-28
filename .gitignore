@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Build outputs
+dist/
+build/
+
+# Environment files
+.env
+.env.local
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environment
+venv/
+env/
+
+# Temporary files
+*.tmp
+*.temp
+create_test_mat.py
+test_mat_read.py
+
+# Model files (optional - uncomment if model is too large)
+# *.keras
+# *.h5
