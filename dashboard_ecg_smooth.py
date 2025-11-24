@@ -8,6 +8,10 @@ import pandas as pd
 import os
 import time
 import plotly.graph_objects as go
+import json
+from datetime import datetime
+import io
+import base64
 
 # ===============================
 # LOAD MODEL ONNX
@@ -21,11 +25,12 @@ def load_onnx_model():
     for model_file, encoder_file, msg in model_files:
         if os.path.exists(model_file) and os.path.exists(encoder_file):
             try:
-                session = ort.InferenceSession(model_file)
+                session = ort.InferenceSession(model_file, providers=['CPUExecutionProvider'])
                 encoder = joblib.load(encoder_file)
                 st.sidebar.success(msg)
                 return session, encoder
-            except:
+            except Exception as e:
+                st.sidebar.error(f"❌ Model load error: {e}")
                 continue
     
     st.sidebar.error("❌ No ONNX model found!")
@@ -56,6 +61,111 @@ def load_ecg_data(record_path):
     record = wfdb.rdrecord(record_path)
     annotation = wfdb.rdann(record_path, 'atr')
     return record, annotation
+
+# ===============================
+# EXPORT FUNCTIONS
+# ===============================
+def export_ecg_data(record, annotation, selected_record):
+    """Export ECG raw data to CSV"""
+    signal = record.p_signal[:, 0]
+    time_axis = np.arange(len(signal)) / record.fs
+    
+    df = pd.DataFrame({
+        'Time (s)': time_axis,
+        'ECG Signal (mV)': signal,
+        'Sample': np.arange(len(signal))
+    })
+    
+    # Add R-peaks if available
+    if annotation is not None:
+        r_peak_times = annotation.sample / record.fs
+        r_peak_df = pd.DataFrame({
+            'R_Peak_Time (s)': r_peak_times,
+            'R_Peak_Sample': annotation.sample,
+            'Annotation': annotation.symbol
+        })
+        return df.to_csv(index=False), r_peak_df.to_csv(index=False)
+    
+    return df.to_csv(index=False), None
+
+def export_analysis_results(hr_stats, rr_intervals, pred_labels, confidence, selected_record):
+    """Export analysis results to JSON"""
+    results = {
+        'record_id': selected_record,
+        'timestamp': datetime.now().isoformat(),
+        'heart_rate_analysis': {
+            'avg_hr': float(hr_stats['avg_hr']),
+            'min_hr': float(hr_stats['min_hr']),
+            'max_hr': float(hr_stats['max_hr']),
+            'rr_mean_ms': float(hr_stats['rr_mean']),
+            'rr_std_ms': float(hr_stats['rr_std']),
+            'total_beats': int(hr_stats['total_beats'])
+        },
+        'rr_intervals': [float(x) for x in rr_intervals],
+        'ai_analysis': {
+            'predictions': pred_labels.tolist(),
+            'confidence_scores': [float(x) for x in confidence],
+            'avg_confidence': float(np.mean(confidence)),
+            'total_beats': len(pred_labels),
+            'abnormal_beats': len([p for p in pred_labels if p != "Normal"])
+        },
+        'arrhythmia_distribution': {str(k): int(v) for k, v in dict(zip(*np.unique(pred_labels, return_counts=True))).items()}
+    }
+    
+    return json.dumps(results, indent=2)
+
+def create_summary_report(record, hr_stats, pred_labels, confidence, selected_record):
+    """Create summary report text"""
+    unique, counts = np.unique(pred_labels, return_counts=True)
+    normal_pct = (counts[unique == "Normal"][0] / len(pred_labels) * 100) if "Normal" in unique else 0
+    
+    report = f"""
+# ECG ANALYSIS REPORT
+
+**Record ID:** {selected_record}
+**Analysis Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Duration:** {len(record.p_signal)/record.fs:.1f} seconds
+**Sampling Rate:** {record.fs} Hz
+
+## HEART RATE ANALYSIS
+- **Average HR:** {hr_stats['avg_hr']:.1f} BPM
+- **Min HR:** {hr_stats['min_hr']:.1f} BPM  
+- **Max HR:** {hr_stats['max_hr']:.1f} BPM
+- **RR Mean:** {hr_stats['rr_mean']:.1f} ms
+- **RR Std (SDNN):** {hr_stats['rr_std']:.1f} ms
+- **Total Beats:** {hr_stats['total_beats']}
+
+## AI ARRHYTHMIA ANALYSIS
+- **Total Beats Analyzed:** {len(pred_labels)}
+- **Average Confidence:** {np.mean(confidence):.3f}
+- **Normal Beats:** {normal_pct:.1f}%
+- **Abnormal Beats:** {100-normal_pct:.1f}%
+
+## ARRHYTHMIA DISTRIBUTION
+"""
+    
+    for arrhythmia, count in zip(unique, counts):
+        percentage = count / len(pred_labels) * 100
+        report += f"- **{arrhythmia}:** {count} beats ({percentage:.1f}%)\n"
+    
+    report += f"""
+
+## MEDICAL ASSESSMENT
+"""
+    
+    if normal_pct > 90:
+        report += "✅ **NORMAL RHYTHM** - No immediate concern\n"
+        report += "📋 **Recommendation:** Regular monitoring, maintain healthy lifestyle\n"
+    elif normal_pct > 70:
+        report += "⚠️ **MILD ARRHYTHMIA** - Monitoring recommended\n"
+        report += "📋 **Recommendation:** Consult cardiologist, avoid excessive caffeine/stress\n"
+    else:
+        report += "🚨 **SIGNIFICANT ARRHYTHMIA** - Medical consultation required\n"
+        report += "📋 **Recommendation:** Immediate medical attention, detailed cardiac evaluation\n"
+    
+    report += "\n⚠️ **Disclaimer:** For educational purposes only. Not for clinical use.\n"
+    
+    return report
 
 # ===============================
 # REAL-TIME ECG
@@ -206,16 +316,17 @@ def smooth_realtime_ecg():
             
             fig.update_layout(**st.session_state.data_buffer[layout_key])
             
-            # Optimized chart config
+            # Optimized chart config with smoother animation
             chart_config = {
                 'displayModeBar': False,
                 'staticPlot': perf_mode == "fast",
                 'responsive': True,
                 'doubleClick': False,
-                'scrollZoom': False
+                'scrollZoom': False,
+                'animation': {'duration': 0} if perf_mode == "fast" else {'duration': 100}
             }
             
-            chart_container.plotly_chart(fig, width='stretch', config=chart_config)
+            chart_container.plotly_chart(fig, use_container_width=True, config=chart_config, key=f"ecg_chart_{st.session_state.rt_index//100}")
             
             # Update frequency tuning
             st.session_state.rt_index += step_size
@@ -322,7 +433,8 @@ def analyze_ecg_with_ai():
     
     session, encoder = load_onnx_model()
     if session is None:
-        raise Exception("Model not loaded")
+        st.error("❌ AI Model not available. Please check if onnx_model files are uploaded.")
+        return None, None, None
 
     beats, target_length = extract_beats(record.p_signal[:, 0], annotation.sample, record.fs)
 
@@ -815,6 +927,53 @@ if "ecg_data" in st.session_state:
                     
                     findings_df = pd.DataFrame(findings_data)
                     st.dataframe(findings_df, width='stretch')
+                    
+                    # Export Section
+                    st.subheader("💾 Export Results")
+                    
+                    export_col1, export_col2, export_col3, export_col4 = st.columns(4)
+                    
+                    with export_col1:
+                        # Export ECG Raw Data
+                        ecg_csv, rpeak_csv = export_ecg_data(record, annotation, selected_record)
+                        st.download_button(
+                            label="📊 Download ECG Data (CSV)",
+                            data=ecg_csv,
+                            file_name=f"ecg_data_{selected_record}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with export_col2:
+                        # Export R-peaks Data
+                        if rpeak_csv:
+                            st.download_button(
+                                label="📈 Download R-peaks (CSV)",
+                                data=rpeak_csv,
+                                file_name=f"rpeaks_{selected_record}.csv",
+                                mime="text/csv"
+                            )
+                    
+                    with export_col3:
+                        # Export Analysis Results
+                        analysis_json = export_analysis_results(hr_stats, rr_intervals, pred_labels, confidence, selected_record)
+                        st.download_button(
+                            label="🔬 Download Analysis (JSON)",
+                            data=analysis_json,
+                            file_name=f"analysis_{selected_record}.json",
+                            mime="application/json"
+                        )
+                    
+                    with export_col4:
+                        # Export Summary Report
+                        summary_report = create_summary_report(record, hr_stats, pred_labels, confidence, selected_record)
+                        st.download_button(
+                            label="📋 Download Report (MD)",
+                            data=summary_report,
+                            file_name=f"report_{selected_record}.md",
+                            mime="text/markdown"
+                        )
+                    
+                    st.success("✅ Analysis completed! Use the buttons above to download results.")
                     
                 except Exception as e:
                     st.error(f"❌ Analysis failed: {e}")
