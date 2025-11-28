@@ -12,6 +12,8 @@ import json
 from datetime import datetime
 import io
 import base64
+from scipy.signal import find_peaks, resample
+from collections import deque
 
 # ===============================
 # LOAD MODEL ONNX
@@ -168,15 +170,72 @@ def create_summary_report(record, hr_stats, pred_labels, confidence, selected_re
     return report
 
 # ===============================
-# REAL-TIME ECG
+# REAL-TIME R-PEAK DETECTION
 # ===============================
-def smooth_realtime_ecg():
+def detect_rpeak_realtime(signal_window, fs, threshold=0.6):
+    """Real-time R-peak detection using adaptive threshold"""
+    if len(signal_window) < fs // 4:  # Need at least 0.25s of data
+        return []
+    
+    # Simple peak detection with adaptive threshold
+    peaks, _ = find_peaks(signal_window, 
+                         height=threshold * np.max(signal_window),
+                         distance=int(0.4 * fs))  # Min 0.4s between peaks
+    return peaks
+
+def extract_beat_realtime(signal, peak_idx, fs, window_size=0.4):
+    """Extract single beat around R-peak for real-time inference"""
+    half_window = int(window_size * fs / 2)
+    start = max(0, peak_idx - half_window)
+    end = min(len(signal), peak_idx + half_window)
+    
+    beat = signal[start:end]
+    
+    # Resample to target length (144 samples)
+    if len(beat) > 0:
+        beat = resample(beat, 144)
+    
+    return beat
+
+def predict_beat_realtime(beat, session, encoder):
+    """Real-time beat classification using ONNX model"""
+    if session is None or len(beat) != 144:
+        return "Unknown", 0.0
+    
+    try:
+        X = beat.reshape(1, 144, 1).astype(np.float32)
+        input_name = session.get_inputs()[0].name
+        pred = session.run(None, {input_name: X})[0]
+        
+        pred_class = np.argmax(pred, axis=1)[0]
+        confidence = np.max(pred, axis=1)[0]
+        label = encoder.inverse_transform([pred_class])[0]
+        
+        return label, confidence
+    except:
+        return "Error", 0.0
+
+# Initialize real-time buffers
+if "realtime_buffer" not in st.session_state:
+    st.session_state.realtime_buffer = deque(maxlen=1000)
+if "rpeak_buffer" not in st.session_state:
+    st.session_state.rpeak_buffer = deque(maxlen=50)
+if "beat_predictions" not in st.session_state:
+    st.session_state.beat_predictions = deque(maxlen=100)
+
+# ===============================
+# REAL-TIME ECG WITH R-PEAK & AI
+# ===============================
+def smooth_realtime_ecg_with_ai():
     if "ecg_data" not in st.session_state:
         st.error("Please load ECG data first")
         return
     
     signal = st.session_state.ecg_data["signal"]
     fs = st.session_state.ecg_data["fs"]
+    
+    # Load AI model for real-time inference
+    session, encoder = load_onnx_model()
     
     # Initialize state with memory management
     if "rt_running" not in st.session_state:
@@ -189,6 +248,10 @@ def smooth_realtime_ecg():
         st.session_state.frame_times = []
     if "data_buffer" not in st.session_state:
         st.session_state.data_buffer = {}
+    if "chart_template" not in st.session_state:
+        st.session_state.chart_template = None
+    if "chart_initialized" not in st.session_state:
+        st.session_state.chart_initialized = False
     
     # Controls with performance selector
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -203,6 +266,8 @@ def smooth_realtime_ecg():
     if st.session_state.perf_mode != perf_mode:
         st.session_state.data_buffer.clear()
         st.session_state.frame_times.clear()
+        st.session_state.chart_template = None
+        st.session_state.chart_initialized = False
     st.session_state.perf_mode = perf_mode
     
     if start_btn:
@@ -215,6 +280,8 @@ def smooth_realtime_ecg():
         st.session_state.rt_index = 0
         st.session_state.data_buffer.clear()
         st.session_state.frame_times.clear()
+        st.session_state.chart_template = None
+        st.session_state.chart_initialized = False
     
     # Enhanced performance settings
     perf_config = {
@@ -263,6 +330,19 @@ def smooth_realtime_ecg():
                 seg = signal[start_idx:end_idx:config["downsample"]]
                 time_seg = np.arange(len(seg)) * config["downsample"] / fs
                 
+                # Real-time R-peak detection
+                rpeaks = detect_rpeak_realtime(seg, fs // config["downsample"])
+                
+                # Beat-per-beat AI inference
+                for peak in rpeaks:
+                    actual_peak_idx = start_idx + peak * config["downsample"]
+                    if actual_peak_idx not in [p[0] for p in st.session_state.rpeak_buffer]:
+                        beat = extract_beat_realtime(signal, actual_peak_idx, fs)
+                        if len(beat) == 144:
+                            label, conf = predict_beat_realtime(beat, session, encoder)
+                            st.session_state.rpeak_buffer.append((actual_peak_idx, label, conf))
+                            st.session_state.beat_predictions.append({"time": actual_peak_idx/fs, "label": label, "confidence": conf})
+                
                 # Cache with size limit
                 if len(st.session_state.data_buffer) < 3:
                     st.session_state.data_buffer[buffer_key] = (seg, time_seg)
@@ -271,20 +351,23 @@ def smooth_realtime_ecg():
                     del st.session_state.data_buffer[oldest]
                     st.session_state.data_buffer[buffer_key] = (seg, time_seg)
             
-            # Optimized figure creation
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=time_seg,
-                y=seg,
-                mode="lines",
-                line=dict(width=config["line_width"], color="#00ff41", simplify=True),
-                showlegend=False,
-                hoverinfo='skip' if perf_mode == "fast" else 'x+y'
-            ))
+            # Template-based chart optimization
+            template_key = f"template_{perf_mode}"
             
-            # Cached layout
-            layout_key = f"layout_{perf_mode}"
-            if layout_key not in st.session_state.data_buffer:
+            # Create or reuse chart template
+            if not st.session_state.chart_initialized or st.session_state.chart_template is None or template_key not in st.session_state.data_buffer:
+                # Create new template
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=[],
+                    y=[],
+                    mode="lines",
+                    line=dict(width=config["line_width"], color="#00ff41", simplify=True),
+                    showlegend=False,
+                    hoverinfo='skip' if perf_mode == "fast" else 'x+y'
+                ))
+                
+                # Configure layout once
                 layout_config = {
                     "title": {
                         'text': "Real-time ECG Monitor",
@@ -312,9 +395,39 @@ def smooth_realtime_ecg():
                         "yaxis": dict(range=[signal.min() * 1.1, signal.max() * 1.1], showgrid=False, zeroline=False)
                     })
                 
-                st.session_state.data_buffer[layout_key] = layout_config
+                fig.update_layout(**layout_config)
+                
+                # Cache template
+                st.session_state.chart_template = fig
+                st.session_state.data_buffer[template_key] = layout_config
+                st.session_state.chart_initialized = True
+            else:
+                # Reuse existing template
+                fig = st.session_state.chart_template
             
-            fig.update_layout(**st.session_state.data_buffer[layout_key])
+            # Update ECG data
+            fig.data[0].x = time_seg
+            fig.data[0].y = seg
+            
+            # Add R-peaks overlay if detected
+            if len(st.session_state.rpeak_buffer) > 0:
+                # Get R-peaks in current window
+                window_rpeaks = [(idx, label, conf) for idx, label, conf in st.session_state.rpeak_buffer 
+                                if start_idx <= idx < end_idx]
+                
+                if window_rpeaks and len(fig.data) == 1:  # Add R-peak trace
+                    fig.add_trace(go.Scatter(
+                        x=[], y=[], mode='markers',
+                        marker=dict(color='red', size=8, symbol='x'),
+                        name='R-peaks', showlegend=False
+                    ))
+                
+                if len(fig.data) > 1 and window_rpeaks:
+                    rpeak_times = [(idx - start_idx) * config["downsample"] / fs for idx, _, _ in window_rpeaks]
+                    rpeak_values = [seg[int((idx - start_idx) // config["downsample"])] for idx, _, _ in window_rpeaks if int((idx - start_idx) // config["downsample"]) < len(seg)]
+                    
+                    fig.data[1].x = rpeak_times
+                    fig.data[1].y = rpeak_values
             
             # Optimized chart config with smoother animation
             chart_config = {
@@ -337,28 +450,63 @@ def smooth_realtime_ecg():
             if len(st.session_state.frame_times) > 10:
                 st.session_state.frame_times.pop(0)
             
-            # Adaptive sleep timing
+            # Optimized timing for smoother animation
             target_time = 1.0 / config["target_fps"]
-            sleep_time = max(0.01, target_time - frame_time) / speed
+            sleep_time = max(0.02, target_time - frame_time) / speed
             
             time.sleep(sleep_time)
             st.rerun()
         else:
             st.session_state.rt_running = False
             st.session_state.data_buffer.clear()
+            st.session_state.chart_template = None
+            st.session_state.chart_initialized = False
             st.success("✅ Monitoring completed!")
     
-    # Enhanced progress display
+    # Enhanced progress display with real-time stats
     if st.session_state.rt_index > 0:
         progress = min(st.session_state.rt_index / len(signal), 1.0)
+        
+        # Real-time statistics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if len(st.session_state.rpeak_buffer) > 0:
+                current_hr = len(st.session_state.rpeak_buffer) * 60 / (st.session_state.rt_index / fs) if st.session_state.rt_index > 0 else 0
+                st.metric("Current HR", f"{current_hr:.0f} BPM")
+            else:
+                st.metric("Current HR", "-- BPM")
+        
+        with col2:
+            if len(st.session_state.beat_predictions) > 0:
+                recent_predictions = list(st.session_state.beat_predictions)[-10:]
+                abnormal_count = sum(1 for p in recent_predictions if p["label"] != "Normal")
+                st.metric("Abnormal (last 10)", f"{abnormal_count}/10")
+            else:
+                st.metric("Abnormal (last 10)", "0/0")
+        
+        with col3:
+            if len(st.session_state.beat_predictions) > 0:
+                avg_conf = np.mean([p["confidence"] for p in st.session_state.beat_predictions])
+                st.metric("Avg Confidence", f"{avg_conf:.3f}")
+            else:
+                st.metric("Avg Confidence", "--")
         
         if perf_mode == "high" and len(st.session_state.frame_times) > 0:
             avg_time = np.mean(st.session_state.frame_times[-5:]) if len(st.session_state.frame_times) >= 5 else np.mean(st.session_state.frame_times)
             fps = 1 / avg_time if avg_time > 0 else 0
             buffer_size = len(st.session_state.data_buffer)
-            st.progress(progress, f"Progress: {progress*100:.1f}% | FPS: {fps:.1f} | Buffer: {buffer_size}")
+            st.progress(progress, f"Progress: {progress*100:.1f}% | FPS: {fps:.1f} | R-peaks: {len(st.session_state.rpeak_buffer)}")
         else:
-            st.progress(progress, f"Progress: {progress*100:.1f}%")
+            st.progress(progress, f"Progress: {progress*100:.1f}% | R-peaks detected: {len(st.session_state.rpeak_buffer)}")
+        
+        # Show recent predictions table
+        if len(st.session_state.beat_predictions) > 0:
+            st.subheader("🔬 Real-time AI Predictions")
+            recent_df = pd.DataFrame(list(st.session_state.beat_predictions)[-10:])
+            recent_df["time"] = recent_df["time"].round(2)
+            recent_df["confidence"] = recent_df["confidence"].round(3)
+            st.dataframe(recent_df, use_container_width=True)
 
 # ===============================
 # CALCULATE HEART RATE
@@ -513,7 +661,7 @@ if "ecg_data" in st.session_state:
     with tab1:
         st.subheader("Real-time ECG Monitor")
         st.info(" real-time ECG monitoring with hospital-grade visualization")
-        smooth_realtime_ecg()
+        smooth_realtime_ecg_with_ai()
     
     with tab2:
         st.subheader("AI Arrhythmia Analysis")
