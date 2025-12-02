@@ -809,7 +809,7 @@ if st.sidebar.button("📂 Load ECG"):
 
 # Main content
 if "ecg_data" in st.session_state:
-    tab1, tab2, tab3 = st.tabs([" Real-time Monitor", " AI Analysis", "📋 ECG Paper Strip"])
+    tab1, tab2, tab3 = st.tabs([" Real-time Monitor", " AI Analysis", " ECG Paper Strip"])
     
     with tab1:
         st.subheader("Real-time ECG Monitor")
@@ -819,7 +819,7 @@ if "ecg_data" in st.session_state:
     with tab2:
         st.subheader("AI Arrhythmia Analysis")
         
-        if st.button("🖨️ Generate ECG Strip"):
+        if st.button(" Generate ECG Strip"):
             with st.spinner("Generating ECG paper strip..."):
                 try:
                     # Get ECG data
@@ -1480,7 +1480,7 @@ if "ecg_data" in st.session_state:
                         st.plotly_chart(fig_qt, use_container_width=True)
                     
                     # ST Segment Analysis
-                    st.write("**💓 ST Segment Analysis**")
+                    st.write("** ST Segment Analysis**")
                     st_deviations = analyze_st_segment(record.p_signal[:, 0], annotation.sample, record.fs)
                     
                     if len(st_deviations) > 0:
@@ -1558,7 +1558,7 @@ if "ecg_data" in st.session_state:
                             st.write(f"- Trend: {rr_trend['trend'].title()}")
                             
                             if abs(rr_trend['r_value']) > 0.7:
-                                st.info("📊 Strong trend detected in RR intervals")
+                                st.info("Strong trend detected in RR intervals")
                     
                     # Export Section
                     st.subheader("💾 Export Results")
@@ -1569,7 +1569,7 @@ if "ecg_data" in st.session_state:
                         # Export ECG Raw Data
                         ecg_csv, rpeak_csv = export_ecg_data(record, annotation, selected_record)
                         st.download_button(
-                            label="📊 Download ECG Data (CSV)",
+                            label=" Download ECG Data (CSV)",
                             data=ecg_csv,
                             file_name=f"ecg_data_{selected_record}.csv",
                             mime="text/csv"
@@ -1579,7 +1579,7 @@ if "ecg_data" in st.session_state:
                         # Export R-peaks Data
                         if rpeak_csv:
                             st.download_button(
-                                label="📈 Download R-peaks (CSV)",
+                                label=" Download R-peaks (CSV)",
                                 data=rpeak_csv,
                                 file_name=f"rpeaks_{selected_record}.csv",
                                 mime="text/csv"
@@ -1589,7 +1589,7 @@ if "ecg_data" in st.session_state:
                         # Export Analysis Results
                         analysis_json = export_analysis_results(hr_stats, rr_intervals, pred_labels, confidence, selected_record)
                         st.download_button(
-                            label="🔬 Download Analysis (JSON)",
+                            label=" Download Analysis (JSON)",
                             data=analysis_json,
                             file_name=f"analysis_{selected_record}.json",
                             mime="application/json"
@@ -1599,7 +1599,7 @@ if "ecg_data" in st.session_state:
                         # Export Summary Report
                         summary_report = create_summary_report(record, hr_stats, pred_labels, confidence, selected_record)
                         st.download_button(
-                            label="📋 Download Report (MD)",
+                            label=" Download Report (MD)",
                             data=summary_report,
                             file_name=f"report_{selected_record}.md",
                             mime="text/markdown"
@@ -1611,10 +1611,10 @@ if "ecg_data" in st.session_state:
                     st.error(f"❌ Analysis failed: {e}")
     
     with tab3:
-        st.subheader("📋 ECG Paper Strip Visualization")
-        st.info("🖨️ Generate hospital-grade ECG strip with abnormality detection")
+        st.subheader(" ECG Paper Strip Visualization")
+        st.info(" Generate hospital-grade ECG strip with abnormality detection")
         
-        if st.button("🖨️ Generate ECG Strip", key="ecg_strip_tab3"):
+        if st.button(" Generate ECG Strip", key="ecg_strip_tab3"):
             with st.spinner("Generating ECG paper strip..."):
                 try:
                     record = st.session_state.ecg_data["record"]
