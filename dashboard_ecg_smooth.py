@@ -12,8 +12,10 @@ import json
 from datetime import datetime
 import io
 import base64
-from scipy.signal import find_peaks, resample
+from scipy.signal import find_peaks, resample, welch, butter, filtfilt
 from collections import deque
+from sklearn.linear_model import LinearRegression
+from scipy.stats import pearsonr
 
 # ===============================
 # LOAD MODEL ONNX
@@ -285,13 +287,18 @@ def smooth_realtime_ecg_with_ai():
     
     # Enhanced performance settings
     perf_config = {
-        "fast": {"window": 2, "downsample": 4, "line_width": 1, "grid": False, "height": 350, "target_fps": 30, "step_mult": 1.5},
-        "balanced": {"window": 3, "downsample": 2, "line_width": 2, "grid": True, "height": 400, "target_fps": 20, "step_mult": 1.0},
-        "high": {"window": 4, "downsample": 1, "line_width": 2, "grid": True, "height": 450, "target_fps": 15, "step_mult": 0.8}
+        "fast": {"window": 2, "downsample": 4, "line_width": 1, "grid": False, "height": 350, "target_fps": 15, "step_mult": 1.5},
+        "balanced": {"window": 3, "downsample": 2, "line_width": 2, "grid": True, "height": 400, "target_fps": 12, "step_mult": 1.0},
+        "high": {"window": 4, "downsample": 1, "line_width": 2, "grid": True, "height": 450, "target_fps": 10, "step_mult": 0.8}
     }
     
     config = perf_config[perf_mode]
+    
+    # Separate containers to prevent full page rerender
     chart_container = st.empty()
+    stats_container = st.empty()
+    progress_container = st.empty()
+    predictions_container = st.empty()
     
     # Real-time loop with frequency tuning and memory management
     if st.session_state.rt_running:
@@ -429,17 +436,19 @@ def smooth_realtime_ecg_with_ai():
                     fig.data[1].x = rpeak_times
                     fig.data[1].y = rpeak_values
             
-            # Optimized chart config with smoother animation
+            # Optimized chart config - disable all animations
             chart_config = {
                 'displayModeBar': False,
-                'staticPlot': perf_mode == "fast",
+                'staticPlot': True,
                 'responsive': True,
                 'doubleClick': False,
                 'scrollZoom': False,
-                'animation': {'duration': 0} if perf_mode == "fast" else {'duration': 100}
+                'animation': {'duration': 0}  # No animation for all modes
             }
             
-            chart_container.plotly_chart(fig, use_container_width=True, config=chart_config, key=f"ecg_chart_{st.session_state.rt_index//100}")
+            # Stable key that changes less frequently
+            stable_key = f"ecg_{perf_mode}_{st.session_state.rt_index//500}"
+            chart_container.plotly_chart(fig, use_container_width=True, config=chart_config, key=stable_key)
             
             # Update frequency tuning
             st.session_state.rt_index += step_size
@@ -461,52 +470,165 @@ def smooth_realtime_ecg_with_ai():
             st.session_state.data_buffer.clear()
             st.session_state.chart_template = None
             st.session_state.chart_initialized = False
-            st.success("✅ Monitoring completed!")
+            with chart_container.container():
+                st.success("✅ Monitoring completed!")
     
-    # Enhanced progress display with real-time stats
+    # Enhanced progress display with real-time stats - separate containers
     if st.session_state.rt_index > 0:
         progress = min(st.session_state.rt_index / len(signal), 1.0)
         
-        # Real-time statistics
-        col1, col2, col3 = st.columns(3)
+        # Update stats container independently
+        with stats_container.container():
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if len(st.session_state.rpeak_buffer) > 0:
+                    current_hr = len(st.session_state.rpeak_buffer) * 60 / (st.session_state.rt_index / fs) if st.session_state.rt_index > 0 else 0
+                    st.metric("Current HR", f"{current_hr:.0f} BPM")
+                else:
+                    st.metric("Current HR", "-- BPM")
+            
+            with col2:
+                if len(st.session_state.beat_predictions) > 0:
+                    recent_predictions = list(st.session_state.beat_predictions)[-10:]
+                    abnormal_count = sum(1 for p in recent_predictions if p["label"] != "Normal")
+                    st.metric("Abnormal (last 10)", f"{abnormal_count}/10")
+                else:
+                    st.metric("Abnormal (last 10)", "0/0")
+            
+            with col3:
+                if len(st.session_state.beat_predictions) > 0:
+                    avg_conf = np.mean([p["confidence"] for p in st.session_state.beat_predictions])
+                    st.metric("Avg Confidence", f"{avg_conf:.3f}")
+                else:
+                    st.metric("Avg Confidence", "--")
         
-        with col1:
-            if len(st.session_state.rpeak_buffer) > 0:
-                current_hr = len(st.session_state.rpeak_buffer) * 60 / (st.session_state.rt_index / fs) if st.session_state.rt_index > 0 else 0
-                st.metric("Current HR", f"{current_hr:.0f} BPM")
+        # Update progress container independently
+        with progress_container.container():
+            if perf_mode == "high" and len(st.session_state.frame_times) > 0:
+                avg_time = np.mean(st.session_state.frame_times[-5:]) if len(st.session_state.frame_times) >= 5 else np.mean(st.session_state.frame_times)
+                fps = 1 / avg_time if avg_time > 0 else 0
+                st.progress(progress, f"Progress: {progress*100:.1f}% | FPS: {fps:.1f} | R-peaks: {len(st.session_state.rpeak_buffer)}")
             else:
-                st.metric("Current HR", "-- BPM")
+                st.progress(progress, f"Progress: {progress*100:.1f}% | R-peaks detected: {len(st.session_state.rpeak_buffer)}")
         
-        with col2:
-            if len(st.session_state.beat_predictions) > 0:
-                recent_predictions = list(st.session_state.beat_predictions)[-10:]
-                abnormal_count = sum(1 for p in recent_predictions if p["label"] != "Normal")
-                st.metric("Abnormal (last 10)", f"{abnormal_count}/10")
-            else:
-                st.metric("Abnormal (last 10)", "0/0")
-        
-        with col3:
-            if len(st.session_state.beat_predictions) > 0:
-                avg_conf = np.mean([p["confidence"] for p in st.session_state.beat_predictions])
-                st.metric("Avg Confidence", f"{avg_conf:.3f}")
-            else:
-                st.metric("Avg Confidence", "--")
-        
-        if perf_mode == "high" and len(st.session_state.frame_times) > 0:
-            avg_time = np.mean(st.session_state.frame_times[-5:]) if len(st.session_state.frame_times) >= 5 else np.mean(st.session_state.frame_times)
-            fps = 1 / avg_time if avg_time > 0 else 0
-            buffer_size = len(st.session_state.data_buffer)
-            st.progress(progress, f"Progress: {progress*100:.1f}% | FPS: {fps:.1f} | R-peaks: {len(st.session_state.rpeak_buffer)}")
-        else:
-            st.progress(progress, f"Progress: {progress*100:.1f}% | R-peaks detected: {len(st.session_state.rpeak_buffer)}")
-        
-        # Show recent predictions table
+        # Update predictions container independently
         if len(st.session_state.beat_predictions) > 0:
-            st.subheader("🔬 Real-time AI Predictions")
-            recent_df = pd.DataFrame(list(st.session_state.beat_predictions)[-10:])
-            recent_df["time"] = recent_df["time"].round(2)
-            recent_df["confidence"] = recent_df["confidence"].round(3)
-            st.dataframe(recent_df, use_container_width=True)
+            with predictions_container.container():
+                st.subheader("🔬 Real-time AI Predictions")
+                recent_df = pd.DataFrame(list(st.session_state.beat_predictions)[-10:])
+                recent_df["time"] = recent_df["time"].round(2)
+                recent_df["confidence"] = recent_df["confidence"].round(3)
+                st.dataframe(recent_df, use_container_width=True)
+
+# ===============================
+# ADVANCED ANALYTICS
+# ===============================
+def analyze_hrv_frequency_domain(rr_intervals, fs=4):
+    """HRV frequency domain analysis"""
+    if len(rr_intervals) < 50:
+        return {}
+    
+    # Resample RR intervals to uniform time series
+    time_rr = np.cumsum(rr_intervals)
+    uniform_time = np.arange(0, time_rr[-1], 1/fs)
+    rr_uniform = np.interp(uniform_time, time_rr[:-1], rr_intervals[:-1])
+    
+    # Remove DC component
+    rr_uniform = rr_uniform - np.mean(rr_uniform)
+    
+    # Power spectral density
+    freqs, psd = welch(rr_uniform, fs=fs, nperseg=min(256, len(rr_uniform)//4))
+    
+    # Frequency bands
+    vlf_band = (freqs >= 0.003) & (freqs < 0.04)  # Very Low Frequency
+    lf_band = (freqs >= 0.04) & (freqs < 0.15)    # Low Frequency
+    hf_band = (freqs >= 0.15) & (freqs < 0.4)     # High Frequency
+    
+    vlf_power = np.trapz(psd[vlf_band], freqs[vlf_band])
+    lf_power = np.trapz(psd[lf_band], freqs[lf_band])
+    hf_power = np.trapz(psd[hf_band], freqs[hf_band])
+    
+    total_power = vlf_power + lf_power + hf_power
+    lf_hf_ratio = lf_power / hf_power if hf_power > 0 else 0
+    
+    return {
+        'vlf_power': vlf_power,
+        'lf_power': lf_power, 
+        'hf_power': hf_power,
+        'total_power': total_power,
+        'lf_hf_ratio': lf_hf_ratio,
+        'lf_norm': lf_power / (lf_power + hf_power) * 100 if (lf_power + hf_power) > 0 else 0,
+        'hf_norm': hf_power / (lf_power + hf_power) * 100 if (lf_power + hf_power) > 0 else 0,
+        'freqs': freqs,
+        'psd': psd
+    }
+
+def detect_qt_intervals(signal, r_peaks, fs):
+    """QT interval detection and analysis"""
+    qt_intervals = []
+    
+    for i, r_peak in enumerate(r_peaks[:-1]):
+        # Define search window for T wave (after R peak)
+        search_start = r_peak + int(0.1 * fs)  # 100ms after R
+        search_end = min(r_peaks[i+1] - int(0.05 * fs), r_peak + int(0.5 * fs))  # Before next R or max 500ms
+        
+        if search_end > search_start:
+            segment = signal[search_start:search_end]
+            
+            # Find T wave end (return to baseline)
+            baseline = np.mean(signal[max(0, r_peak-int(0.1*fs)):r_peak])
+            
+            # Simple T wave end detection
+            for j in range(len(segment)-1, 0, -1):
+                if abs(segment[j] - baseline) < 0.1 * np.std(segment):
+                    t_end = search_start + j
+                    qt_interval = (t_end - r_peak) / fs * 1000  # in ms
+                    if 200 < qt_interval < 600:  # Valid QT range
+                        qt_intervals.append(qt_interval)
+                    break
+    
+    return np.array(qt_intervals)
+
+def analyze_st_segment(signal, r_peaks, fs):
+    """ST segment analysis for ischemia detection"""
+    st_deviations = []
+    
+    for r_peak in r_peaks:
+        # ST segment: 80ms after R peak
+        st_point = r_peak + int(0.08 * fs)
+        
+        if st_point < len(signal):
+            # Baseline: before R peak
+            baseline_start = max(0, r_peak - int(0.1 * fs))
+            baseline_end = max(0, r_peak - int(0.02 * fs))
+            
+            if baseline_end > baseline_start:
+                baseline = np.mean(signal[baseline_start:baseline_end])
+                st_level = signal[st_point]
+                st_deviation = (st_level - baseline) * 1000  # in mV
+                st_deviations.append(st_deviation)
+    
+    return np.array(st_deviations)
+
+def trend_analysis(values, times):
+    """Trend analysis using linear regression"""
+    if len(values) < 3:
+        return {'slope': 0, 'r_value': 0, 'trend': 'stable'}
+    
+    X = times.reshape(-1, 1)
+    model = LinearRegression().fit(X, values)
+    slope = model.coef_[0]
+    r_value, _ = pearsonr(times, values)
+    
+    if abs(slope) < 0.01:
+        trend = 'stable'
+    elif slope > 0:
+        trend = 'increasing'
+    else:
+        trend = 'decreasing'
+    
+    return {'slope': slope, 'r_value': r_value, 'trend': trend}
 
 # ===============================
 # CALCULATE HEART RATE
@@ -611,6 +733,37 @@ def analyze_ecg_with_ai():
 # MAIN APP
 # ===============================
 st.set_page_config(page_title="ECG Monitor", layout="wide")
+
+# CSS optimization - disable transitions
+st.markdown("""
+<style>
+/* Disable all transitions and animations */
+* {
+    transition: none !important;
+    animation: none !important;
+}
+
+/* Optimize chart rendering */
+.js-plotly-plot {
+    transition: none !important;
+}
+
+/* Reduce reflow */
+.stMetric {
+    transition: none !important;
+}
+
+.stProgress {
+    transition: none !important;
+}
+
+/* Stable layout */
+.main .block-container {
+    padding-top: 1rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title(" Real-time ECG Monitor & AI Detector")
 
 # Sidebar
@@ -656,7 +809,7 @@ if st.sidebar.button("📂 Load ECG"):
 
 # Main content
 if "ecg_data" in st.session_state:
-    tab1, tab2 = st.tabs([" Real-time Monitor", " AI Analysis"])
+    tab1, tab2, tab3 = st.tabs([" Real-time Monitor", " AI Analysis", "📋 ECG Paper Strip"])
     
     with tab1:
         st.subheader("Real-time ECG Monitor")
@@ -666,7 +819,153 @@ if "ecg_data" in st.session_state:
     with tab2:
         st.subheader("AI Arrhythmia Analysis")
         
-        if st.button(" Analyze with AI"):
+        if st.button("🖨️ Generate ECG Strip"):
+            with st.spinner("Generating ECG paper strip..."):
+                try:
+                    # Get ECG data
+                    record = st.session_state.ecg_data["record"]
+                    annotation = st.session_state.ecg_data["annotation"]
+                    signal = record.p_signal[:, 0]
+                    fs = record.fs
+                    
+                    # Create paper-like ECG strip
+                    duration = min(30, len(signal) / fs)  # Max 30 seconds
+                    samples = int(duration * fs)
+                    time_axis = np.arange(samples) / fs
+                    ecg_segment = signal[:samples]
+                    
+                    # Get AI predictions for this segment
+                    session, encoder = load_onnx_model()
+                    if session:
+                        # Get R-peaks in segment
+                        segment_rpeaks = annotation.sample[annotation.sample < samples]
+                        
+                        # Extract beats and predict
+                        beats, _ = extract_beats(ecg_segment, segment_rpeaks, fs)
+                        if len(beats) > 0:
+                            valid_beats = [b for b in beats if len(b) == 144 or len(b) == 58]
+                            if valid_beats:
+                                X = np.array(valid_beats)
+                                if X.shape[1] == 58:
+                                    from scipy import signal as scipy_signal
+                                    X = np.array([scipy_signal.resample(x, 144) for x in X])
+                                X = X.reshape(len(X), 144, 1).astype(np.float32)
+                                
+                                input_name = session.get_inputs()[0].name
+                                preds = session.run(None, {input_name: X})[0]
+                                pred_class = np.argmax(preds, axis=1)
+                                pred_labels = encoder.inverse_transform(pred_class)
+                                confidence = np.max(preds, axis=1)
+                    
+                    # Create ECG paper strip figure
+                    fig = go.Figure()
+                    
+                    # ECG signal
+                    fig.add_trace(go.Scatter(
+                        x=time_axis,
+                        y=ecg_segment,
+                        mode='lines',
+                        line=dict(color='black', width=1.5),
+                        name='ECG',
+                        showlegend=False
+                    ))
+                    
+                    # Add R-peaks
+                    rpeak_times = segment_rpeaks / fs
+                    rpeak_values = ecg_segment[segment_rpeaks]
+                    
+                    fig.add_trace(go.Scatter(
+                        x=rpeak_times,
+                        y=rpeak_values,
+                        mode='markers',
+                        marker=dict(color='red', size=6, symbol='circle'),
+                        name='R-peaks',
+                        showlegend=False
+                    ))
+                    
+                    # Add abnormality annotations
+                    if 'pred_labels' in locals():
+                        for i, (rpeak_time, label, conf) in enumerate(zip(rpeak_times[:len(pred_labels)], pred_labels, confidence)):
+                            if label != "Normal":
+                                fig.add_annotation(
+                                    x=rpeak_time,
+                                    y=max(ecg_segment) * 1.2,
+                                    text=f"{label}<br>{conf:.2f}",
+                                    showarrow=True,
+                                    arrowhead=2,
+                                    arrowcolor="red",
+                                    bgcolor="yellow",
+                                    bordercolor="red",
+                                    font=dict(size=10, color="red")
+                                )
+                    
+                    # ECG paper grid styling
+                    fig.update_layout(
+                        title=f"ECG Paper Strip - Record {selected_record} ({duration:.1f}s)",
+                        xaxis=dict(
+                            title="Time (seconds)",
+                            showgrid=True,
+                            gridwidth=1,
+                            gridcolor="lightcoral",
+                            minor=dict(showgrid=True, gridwidth=0.5, gridcolor="pink"),
+                            dtick=0.2,  # Major grid every 0.2s (5 small squares)
+                            range=[0, duration]
+                        ),
+                        yaxis=dict(
+                            title="Amplitude (mV)",
+                            showgrid=True,
+                            gridwidth=1,
+                            gridcolor="lightcoral",
+                            minor=dict(showgrid=True, gridwidth=0.5, gridcolor="pink"),
+                            dtick=0.5,  # Major grid every 0.5mV
+                            range=[min(ecg_segment)*1.2, max(ecg_segment)*1.4]
+                        ),
+                        plot_bgcolor="white",
+                        paper_bgcolor="white",
+                        width=1200,
+                        height=400,
+                        font=dict(color="black", size=12)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Summary of abnormalities
+                    if 'pred_labels' in locals():
+                        abnormal_beats = [(i, label, conf) for i, (label, conf) in enumerate(zip(pred_labels, confidence)) if label != "Normal"]
+                        
+                        if abnormal_beats:
+                            st.subheader("🚨 Detected Abnormalities")
+                            
+                            abnormal_df = pd.DataFrame([
+                                {
+                                    "Beat #": i+1,
+                                    "Time (s)": f"{rpeak_times[i]:.2f}",
+                                    "Abnormality": label,
+                                    "Confidence": f"{conf:.3f}",
+                                    "Severity": "High" if conf > 0.8 else "Medium" if conf > 0.6 else "Low"
+                                }
+                                for i, label, conf in abnormal_beats
+                            ])
+                            
+                            st.dataframe(abnormal_df, use_container_width=True)
+                            
+                            # Download ECG strip as image
+                            img_bytes = fig.to_image(format="png", width=1200, height=400, scale=2)
+                            st.download_button(
+                                label="📥 Download ECG Strip (PNG)",
+                                data=img_bytes,
+                                file_name=f"ecg_strip_{selected_record}.png",
+                                mime="image/png"
+                            )
+                        else:
+                            st.success("✅ No abnormalities detected in this segment")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error generating ECG strip: {e}")
+        
+        st.markdown("---")
+        
+        if st.button(" Analyze with AI", key="ai_analysis_btn"):
             with st.spinner(" Analyzing ECG..."):
                 try:
                     pred_labels, confidence, beats = analyze_ecg_with_ai()
@@ -1076,6 +1375,191 @@ if "ecg_data" in st.session_state:
                     findings_df = pd.DataFrame(findings_data)
                     st.dataframe(findings_df, width='stretch')
                     
+                    # Advanced Analytics Dashboard
+                    st.subheader("📊 Advanced Analytics Dashboard")
+                    
+                    # HRV Frequency Domain Analysis
+                    st.write("**🔬 HRV Frequency Domain Analysis**")
+                    hrv_freq = analyze_hrv_frequency_domain(rr_intervals)
+                    
+                    if hrv_freq:
+                        freq_col1, freq_col2, freq_col3 = st.columns(3)
+                        
+                        with freq_col1:
+                            st.metric("LF Power", f"{hrv_freq['lf_power']:.1f} ms²")
+                            st.metric("HF Power", f"{hrv_freq['hf_power']:.1f} ms²")
+                        
+                        with freq_col2:
+                            st.metric("LF/HF Ratio", f"{hrv_freq['lf_hf_ratio']:.2f}")
+                            st.metric("Total Power", f"{hrv_freq['total_power']:.1f} ms²")
+                        
+                        with freq_col3:
+                            st.metric("LF Norm", f"{hrv_freq['lf_norm']:.1f}%")
+                            st.metric("HF Norm", f"{hrv_freq['hf_norm']:.1f}%")
+                        
+                        # PSD Plot
+                        fig_psd = go.Figure()
+                        fig_psd.add_trace(go.Scatter(
+                            x=hrv_freq['freqs'],
+                            y=hrv_freq['psd'],
+                            mode='lines',
+                            fill='tozeroy',
+                            name='PSD'
+                        ))
+                        
+                        # Add frequency band markers
+                        fig_psd.add_vrect(x0=0.04, x1=0.15, fillcolor="red", opacity=0.2, annotation_text="LF")
+                        fig_psd.add_vrect(x0=0.15, x1=0.4, fillcolor="blue", opacity=0.2, annotation_text="HF")
+                        
+                        fig_psd.update_layout(
+                            title="HRV Power Spectral Density",
+                            xaxis_title="Frequency (Hz)",
+                            yaxis_title="Power (ms²/Hz)",
+                            height=300
+                        )
+                        st.plotly_chart(fig_psd, use_container_width=True)
+                        
+                        # HRV Assessment
+                        if hrv_freq['lf_hf_ratio'] > 2.5:
+                            st.warning("⚠️ High LF/HF ratio - Possible sympathetic dominance")
+                        elif hrv_freq['lf_hf_ratio'] < 0.5:
+                            st.info("📈 Low LF/HF ratio - Possible parasympathetic dominance")
+                        else:
+                            st.success("✅ Balanced autonomic function")
+                    
+                    # QT Interval Analysis
+                    st.write("**⚡ QT Interval Analysis**")
+                    qt_intervals = detect_qt_intervals(record.p_signal[:, 0], annotation.sample, record.fs)
+                    
+                    if len(qt_intervals) > 0:
+                        qt_col1, qt_col2, qt_col3 = st.columns(3)
+                        
+                        qtc_bazett = qt_intervals / np.sqrt(rr_intervals[:len(qt_intervals)] / 1000)  # Bazett correction
+                        
+                        with qt_col1:
+                            st.metric("Avg QT", f"{np.mean(qt_intervals):.0f} ms")
+                            st.metric("QT Range", f"{np.max(qt_intervals) - np.min(qt_intervals):.0f} ms")
+                        
+                        with qt_col2:
+                            st.metric("Avg QTc", f"{np.mean(qtc_bazett):.0f} ms")
+                            st.metric("QTc Std", f"{np.std(qtc_bazett):.1f} ms")
+                        
+                        with qt_col3:
+                            # QTc Assessment
+                            avg_qtc = np.mean(qtc_bazett)
+                            if avg_qtc > 450:
+                                st.error("🚨 Prolonged QTc (>450ms)")
+                            elif avg_qtc < 350:
+                                st.warning("⚠️ Short QTc (<350ms)")
+                            else:
+                                st.success("✅ Normal QTc (350-450ms)")
+                        
+                        # QT Trend Plot
+                        fig_qt = go.Figure()
+                        fig_qt.add_trace(go.Scatter(
+                            x=np.arange(len(qt_intervals)),
+                            y=qt_intervals,
+                            mode='lines+markers',
+                            name='QT Interval',
+                            line=dict(color='purple')
+                        ))
+                        fig_qt.add_trace(go.Scatter(
+                            x=np.arange(len(qtc_bazett)),
+                            y=qtc_bazett,
+                            mode='lines+markers',
+                            name='QTc (Bazett)',
+                            line=dict(color='orange')
+                        ))
+                        
+                        fig_qt.update_layout(
+                            title="QT/QTc Interval Trend",
+                            xaxis_title="Beat Number",
+                            yaxis_title="Interval (ms)",
+                            height=300
+                        )
+                        st.plotly_chart(fig_qt, use_container_width=True)
+                    
+                    # ST Segment Analysis
+                    st.write("**💓 ST Segment Analysis**")
+                    st_deviations = analyze_st_segment(record.p_signal[:, 0], annotation.sample, record.fs)
+                    
+                    if len(st_deviations) > 0:
+                        st_col1, st_col2, st_col3 = st.columns(3)
+                        
+                        with st_col1:
+                            st.metric("Avg ST Deviation", f"{np.mean(st_deviations):.2f} mV")
+                            st.metric("ST Std", f"{np.std(st_deviations):.2f} mV")
+                        
+                        with st_col2:
+                            st.metric("Max ST Elevation", f"{np.max(st_deviations):.2f} mV")
+                            st.metric("Max ST Depression", f"{np.min(st_deviations):.2f} mV")
+                        
+                        with st_col3:
+                            # ST Assessment
+                            if np.any(st_deviations > 1.0):
+                                st.error("🚨 ST Elevation (>1mV)")
+                            elif np.any(st_deviations < -1.0):
+                                st.error("🚨 ST Depression (<-1mV)")
+                            else:
+                                st.success("✅ Normal ST Segment")
+                        
+                        # ST Trend Plot
+                        fig_st = go.Figure()
+                        fig_st.add_trace(go.Scatter(
+                            x=np.arange(len(st_deviations)),
+                            y=st_deviations,
+                            mode='lines+markers',
+                            name='ST Deviation',
+                            line=dict(color='red')
+                        ))
+                        
+                        # Add reference lines
+                        fig_st.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="ST Elevation Threshold")
+                        fig_st.add_hline(y=-1.0, line_dash="dash", line_color="blue", annotation_text="ST Depression Threshold")
+                        
+                        fig_st.update_layout(
+                            title="ST Segment Deviation Trend",
+                            xaxis_title="Beat Number",
+                            yaxis_title="ST Deviation (mV)",
+                            height=300
+                        )
+                        st.plotly_chart(fig_st, use_container_width=True)
+                    
+                    # Trend Analysis
+                    st.write("**📈 Trend Analysis**")
+                    
+                    trend_col1, trend_col2 = st.columns(2)
+                    
+                    with trend_col1:
+                        # HR Trend
+                        if len(instantaneous_hr) > 3:
+                            hr_times = annotation.sample[1:len(instantaneous_hr)+1] / record.fs
+                            hr_trend = trend_analysis(instantaneous_hr, hr_times)
+                            
+                            st.write("**Heart Rate Trend:**")
+                            st.write(f"- Slope: {hr_trend['slope']:.3f} BPM/s")
+                            st.write(f"- Correlation: {hr_trend['r_value']:.3f}")
+                            st.write(f"- Trend: {hr_trend['trend'].title()}")
+                            
+                            if hr_trend['trend'] == 'increasing' and hr_trend['r_value'] > 0.5:
+                                st.warning("⚠️ Significant HR increase detected")
+                            elif hr_trend['trend'] == 'decreasing' and hr_trend['r_value'] < -0.5:
+                                st.warning("⚠️ Significant HR decrease detected")
+                    
+                    with trend_col2:
+                        # RR Trend
+                        if len(rr_intervals) > 3:
+                            rr_times = annotation.sample[1:len(rr_intervals)+1] / record.fs
+                            rr_trend = trend_analysis(rr_intervals * 1000, rr_times)
+                            
+                            st.write("**RR Interval Trend:**")
+                            st.write(f"- Slope: {rr_trend['slope']:.3f} ms/s")
+                            st.write(f"- Correlation: {rr_trend['r_value']:.3f}")
+                            st.write(f"- Trend: {rr_trend['trend'].title()}")
+                            
+                            if abs(rr_trend['r_value']) > 0.7:
+                                st.info("📊 Strong trend detected in RR intervals")
+                    
                     # Export Section
                     st.subheader("💾 Export Results")
                     
@@ -1125,6 +1609,103 @@ if "ecg_data" in st.session_state:
                     
                 except Exception as e:
                     st.error(f"❌ Analysis failed: {e}")
+    
+    with tab3:
+        st.subheader("📋 ECG Paper Strip Visualization")
+        st.info("🖨️ Generate hospital-grade ECG strip with abnormality detection")
+        
+        if st.button("🖨️ Generate ECG Strip", key="ecg_strip_tab3"):
+            with st.spinner("Generating ECG paper strip..."):
+                try:
+                    record = st.session_state.ecg_data["record"]
+                    annotation = st.session_state.ecg_data["annotation"]
+                    signal = record.p_signal[:, 0]
+                    fs = record.fs
+                    
+                    duration = min(30, len(signal) / fs)
+                    samples = int(duration * fs)
+                    time_axis = np.arange(samples) / fs
+                    ecg_segment = signal[:samples]
+                    
+                    session, encoder = load_onnx_model()
+                    if session:
+                        segment_rpeaks = annotation.sample[annotation.sample < samples]
+                        beats, _ = extract_beats(ecg_segment, segment_rpeaks, fs)
+                        if len(beats) > 0:
+                            valid_beats = [b for b in beats if len(b) == 144 or len(b) == 58]
+                            if valid_beats:
+                                X = np.array(valid_beats)
+                                if X.shape[1] == 58:
+                                    from scipy import signal as scipy_signal
+                                    X = np.array([scipy_signal.resample(x, 144) for x in X])
+                                X = X.reshape(len(X), 144, 1).astype(np.float32)
+                                
+                                input_name = session.get_inputs()[0].name
+                                preds = session.run(None, {input_name: X})[0]
+                                pred_class = np.argmax(preds, axis=1)
+                                pred_labels = encoder.inverse_transform(pred_class)
+                                confidence = np.max(preds, axis=1)
+                    
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=time_axis, y=ecg_segment, mode='lines',
+                        line=dict(color='black', width=1.5), name='ECG', showlegend=False
+                    ))
+                    
+                    rpeak_times = segment_rpeaks / fs
+                    rpeak_values = ecg_segment[segment_rpeaks]
+                    
+                    fig.add_trace(go.Scatter(
+                        x=rpeak_times, y=rpeak_values, mode='markers',
+                        marker=dict(color='red', size=6, symbol='circle'), name='R-peaks', showlegend=False
+                    ))
+                    
+                    if 'pred_labels' in locals():
+                        for i, (rpeak_time, label, conf) in enumerate(zip(rpeak_times[:len(pred_labels)], pred_labels, confidence)):
+                            if label != "Normal":
+                                fig.add_annotation(
+                                    x=rpeak_time, y=max(ecg_segment) * 1.2,
+                                    text=f"{label}<br>{conf:.2f}", showarrow=True,
+                                    arrowhead=2, arrowcolor="red", bgcolor="yellow",
+                                    bordercolor="red", font=dict(size=10, color="red")
+                                )
+                    
+                    fig.update_layout(
+                        title=f"ECG Paper Strip - Record {selected_record} ({duration:.1f}s)",
+                        xaxis=dict(title="Time (seconds)", showgrid=True, gridwidth=1, gridcolor="lightcoral",
+                                  dtick=0.2, range=[0, duration]),
+                        yaxis=dict(title="Amplitude (mV)", showgrid=True, gridwidth=1, gridcolor="lightcoral",
+                                  dtick=0.5, range=[min(ecg_segment)*1.2, max(ecg_segment)*1.4]),
+                        plot_bgcolor="white", paper_bgcolor="white", width=1200, height=400,
+                        font=dict(color="black", size=12)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    if 'pred_labels' in locals():
+                        abnormal_beats = [(i, label, conf) for i, (label, conf) in enumerate(zip(pred_labels, confidence)) if label != "Normal"]
+                        
+                        if abnormal_beats:
+                            st.subheader("🚨 Detected Abnormalities")
+                            abnormal_df = pd.DataFrame([{
+                                "Beat #": i+1, "Time (s)": f"{rpeak_times[i]:.2f}",
+                                "Abnormality": label, "Confidence": f"{conf:.3f}",
+                                "Severity": "High" if conf > 0.8 else "Medium" if conf > 0.6 else "Low"
+                            } for i, label, conf in abnormal_beats])
+                            
+                            st.dataframe(abnormal_df, use_container_width=True)
+                            
+                            img_bytes = fig.to_image(format="png", width=1200, height=400, scale=2)
+                            st.download_button(
+                                label="📥 Download ECG Strip (PNG)",
+                                data=img_bytes, file_name=f"ecg_strip_{selected_record}.png", mime="image/png"
+                            )
+                        else:
+                            st.success("✅ No abnormalities detected in this segment")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error generating ECG strip: {e}")
 
 else:
     st.info(" Please load an ECG file from the sidebar to start monitoring")
